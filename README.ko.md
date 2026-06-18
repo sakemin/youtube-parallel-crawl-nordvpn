@@ -91,7 +91,7 @@ youtube-parallel-crawl-nordvpn/
     crawler.py                # 샤드별 워커(네임스페이스 안에서 실행)
     requirements.txt          # yt-dlp 등
   examples/ids.example.txt    # 예시 입력
-  skill/SKILL.md              # 운영 인사이트
+  .claude/skills/youtube-parallel-crawl-nordvpn/SKILL.md   # Claude skill (자동 인식)
   README.md / README.ko.md
 ```
 
@@ -229,6 +229,35 @@ $VENV/bin/python crawler/crawler.py IDS_FILE OUTPUT_DIR \
 - **다른 VPN:** 패턴은 그대로입니다 — 앱별 네임스페이스 격리 + 서로 다른 대역의 워커 + 연결마다 인증하는 프로토콜보다 정적 키(WireGuard) 선호.
 - **약 10개 이상의 서로 다른 IP가 필요하면:** NordVPN 상한은 단단합니다. **로테이팅 residential/datacenter 프록시 풀**로 전환하세요(vopono는 "깨끗하고 격리된 소수의 IP"를 위한 도구).
 - **YouTube가 아닌 대상:** 격리/다양성/실패 분류의 뼈대는 유지하고, 다운로더와 block/permanent/transient 문자열 매칭만 교체하세요.
+
+---
+
+## Claude Code skill로 설치
+
+이 repo에는 [Agent Skill](https://agentskills.io)(Claude Code · Claude 앱 · Agent
+SDK에서 공유되는 오픈 포맷)이 `.claude/skills/youtube-parallel-crawl-nordvpn/SKILL.md`
+에 포함되어 있습니다. 운영 playbook과 네 개의 벽을 담고 있어, 에이전트가 검증된
+설정에서 바로 시작합니다.
+
+**설치 방법 두 가지:**
+
+```bash
+# A) 프로젝트 skill (자동 인식) — 클론한 repo 폴더 안에서 작업:
+git clone https://github.com/sakemin/youtube-parallel-crawl-nordvpn
+cd youtube-parallel-crawl-nordvpn
+claude          # Claude Code가 이 프로젝트의 .claude/skills/를 자동 인식
+                # (Claude Code 시작 시 .claude/skills/가 없었다면 재시작 필요)
+
+# B) 개인 skill (전역) — 모든 프로젝트에서 사용:
+mkdir -p ~/.claude/skills/youtube-parallel-crawl-nordvpn
+cp .claude/skills/youtube-parallel-crawl-nordvpn/SKILL.md \
+   ~/.claude/skills/youtube-parallel-crawl-nordvpn/
+# 그 다음 Claude Code 재시작 / 새 세션
+```
+
+병렬 YouTube 크롤, 워커별 VPN IP, YouTube bot-detection / 429 / 403을 물어보면
+자동으로 활성화됩니다. 오픈 Agent Skill이라 같은 `SKILL.md`가 claude.ai와 Agent
+SDK에서도 동작합니다.
 
 ---
 

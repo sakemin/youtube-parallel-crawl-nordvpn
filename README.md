@@ -286,6 +286,36 @@ block/permanent/transient string matches in `crawler/crawler.py`.
 
 ---
 
+## Use as a Claude Code skill
+
+This repo ships with an [Agent Skill](https://agentskills.io) — the open, portable
+skill format used by Claude Code, the Claude apps, and the Claude Agent SDK — at
+`.claude/skills/youtube-parallel-crawl-nordvpn/SKILL.md`. It encodes the operating
+playbook and the four hard-won walls so an agent works from the proven config
+instead of re-deriving them.
+
+**Two ways to install it:**
+
+```bash
+# A) Project skill (auto-discovered) — just work inside the cloned repo:
+git clone https://github.com/sakemin/youtube-parallel-crawl-nordvpn
+cd youtube-parallel-crawl-nordvpn
+claude          # Claude Code auto-discovers .claude/skills/ for this project.
+                # (If .claude/skills/ did not exist when Claude Code started, restart it.)
+
+# B) Personal skill (global) — available in every project:
+mkdir -p ~/.claude/skills/youtube-parallel-crawl-nordvpn
+cp .claude/skills/youtube-parallel-crawl-nordvpn/SKILL.md \
+   ~/.claude/skills/youtube-parallel-crawl-nordvpn/
+# then restart Claude Code / start a new session
+```
+
+It auto-activates when you ask about parallel YouTube crawling, per-worker VPN
+IPs, or YouTube bot-detection / 429 / 403 at scale. Being an open Agent Skill, the
+same `SKILL.md` also works on claude.ai and via the Agent SDK.
+
+---
+
 ## Credits
 
 Built with [Claude Code](https://claude.com/claude-code) (Anthropic), hardened
