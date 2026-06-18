@@ -1,0 +1,4 @@
+# Python dependencies for the per-shard crawler (crawler/crawler.py).
+# Pinned to a floor that has the modern YouTube extractor + format-140 handling;
+# upgrade freely — yt-dlp ships frequent fixes for YouTube's anti-bot changes.
+yt-dlp>=2024.12.13

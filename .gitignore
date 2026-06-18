@@ -1,0 +1,24 @@
+# Local configuration (copy of config.example.env with your real values)
+config.env
+
+# Crawl output (audio, metadata, logs, per-shard archives)
+output/
+
+# Python virtual environment
+.venv/
+
+# Generated VPN server pool
+servers.txt
+
+# Logs
+*.log
+
+# Python bytecode caches
+__pycache__/
+
+# Your private input / credentials (never commit)
+ids.txt
+cookies.txt
+
+# macOS noise
+.DS_Store

@@ -1,0 +1,9 @@
+# Example input for IDS_FILE: one YouTube video ID OR full URL per line.
+# Both forms work (the crawler accepts a bare 11-char ID or any youtube/youtu.be URL).
+# These are well-known, long-standing public videos. Copy this to ./ids.txt and
+# replace it with your own list. Blank lines and lines starting with # are ignored.
+dQw4w9WgXcQ
+jNQXAC9IVRw
+https://www.youtube.com/watch?v=9bZkp7q19f0
+https://youtu.be/kJQP7kiw5Fk
+https://www.youtube.com/watch?v=hT_nvWreIhg

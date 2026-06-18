@@ -1,0 +1,49 @@
+name: ci
+
+# Lint every shell script and byte-compile the Python crawler on each push / PR.
+# This is a static-only check: it never runs the VPN/crawl pipeline (which needs
+# root, NordVPN credentials, and vopono — none of which exist on CI runners).
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: shellcheck (bash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint all shell scripts
+        run: |
+          # Find every *.sh in the repo (top-level crawl.sh, bin/*.sh, helpers).
+          # -x lets shellcheck follow `source config.env` etc. across files.
+          mapfile -t scripts < <(find . -type f -name '*.sh' | sort)
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "No shell scripts found to lint." >&2
+            exit 1
+          fi
+          printf 'Linting %d script(s):\n' "${#scripts[@]}"
+          printf '  %s\n' "${scripts[@]}"
+          shellcheck -x "${scripts[@]}"
+
+  py-compile:
+    name: py_compile (crawler)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Byte-compile the crawler
+        run: python -m py_compile crawler/crawler.py
