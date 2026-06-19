@@ -5,21 +5,28 @@
 #
 # WHAT THIS DOES
 #   Launches $WORKERS parallel crawler workers. Each worker runs INSIDE its own
-#   vopono network namespace bound to a DISTINCT country's VPN server (= a
-#   distinct exit IP in a distinct /16), and processes a DISJOINT shard of the
-#   id list (index % WORKERS == shard). The HOST default route is NEVER touched,
-#   so SSH / the agent / everything else keeps its clean, non-VPN connection.
+#   vopono network namespace and processes a DISJOINT shard of the id list
+#   (index % WORKERS == shard). The HOST default route is NEVER touched, so SSH /
+#   the agent / everything else keeps its clean, non-VPN connection.
 #
-#   Within a worker, a "batch" of up to $LIMIT successful downloads runs back to
-#   back on one IP; when the batch ends the worker relaunches in a fresh
-#   namespace on the NEXT server within ITS OWN country -> a new IP, same /16.
+#   Each "batch" of up to $LIMIT successful downloads runs on ONE leased IP. The
+#   IP is leased from a single SHARED pool of all dialable servers, with four
+#   guarantees (see claim_server/release_server):
+#     * no two workers ever hold the same IP at once   (lease)
+#     * the W live IPs sit in W distinct countries/ranges (distinct-country pref)
+#     * a just-released IP is not grabbed back-to-back  (RECENT window)
+#     * an IP that trips YouTube's "not a bot" check goes DORMANT ~30 min
 #
 # WHY (the hard-won facts — see README / skill for the full story):
-#   * ONE distinct COUNTRY per worker  -> the W live IPs sit in W distinct /16s,
-#     which avoids YouTube's subnet-level bot detection (workers stacked on one
+#   * DISTINCT concurrent ranges  -> the W live IPs sit in W distinct /16s, which
+#     avoids YouTube's subnet-level bot detection (workers stacked on one
 #     provider /24 trip "Sign in to confirm you're not a bot" ~86% of the time).
+#   * DORMANCY for flagged IPs     -> a bot-flagged IP is quarantined and the
+#     worker leases a fresh one, instead of hammering a burned IP.
 #   * WireGuard (static key, no per-connection auth) -> nothing for NordVPN to
 #     auth-throttle, so the fleet does not collapse under reconnect churn.
+#   * --dns a robust resolver      -> the provider's own DNS rate-limits under W
+#     parallel namespaces; a public resolver (through the tunnel) avoids that.
 #   * A global setup-lock serializes the racy vopono netns/veth/NetworkManager
 #     setup window (concurrent starts race on the shared unmanaged.conf).
 #   * The HOST stays OFF the VPN. That is the whole point.
@@ -51,7 +58,8 @@ REPO="$HERE"
 # any config knobs already set in the environment, source config, then re-apply.
 _ypcn_keys=(IDS_FILE OUTPUT_DIR YTDLP_FORMAT COOKIES_FILE VPN_PROVIDER VPN_PROTOCOL
   COUNTRIES WORKERS THREADS LIMIT BLOCK_BUDGET SETUP_WINDOW STAGGER SETTLE
-  MAX_FAILS MIN_SUBSET CAP AUTH_COOLDOWN POOL_FILE WG_DIR VENV)
+  MAX_FAILS MIN_SUBSET CAP AUTH_COOLDOWN POOL_FILE WG_DIR VENV
+  COOLDOWN_MIN RECENT_SEC LEASE_TTL BOT_FLAG_THRESHOLD VPN_DNS)
 _ypcn_ovr=()
 for _k in "${_ypcn_keys[@]}"; do [[ -n "${!_k+x}" ]] && _ypcn_ovr+=("$_k=${!_k}"); done
 # shellcheck source=/dev/null
@@ -99,6 +107,16 @@ VPN_PROVIDER="${VPN_PROVIDER:-nordvpn}"
 # but the files must stay owned by the human who started the crawl.
 RUN_USER="${RUN_USER:-${SUDO_USER:-$USER}}"
 
+# --- global IP-pool allocation knobs (defaults; overridable via config.env) ---
+# All workers lease from ONE shared pool instead of being pinned to a country.
+COOLDOWN_MIN="${COOLDOWN_MIN:-30}"             # minutes a bot-flagged IP stays dormant
+RECENT_SEC="${RECENT_SEC:-180}"               # seconds before a released IP is reusable
+LEASE_TTL="${LEASE_TTL:-1800}"                # seconds before an abandoned lease is reclaimed
+BOT_FLAG_THRESHOLD="${BOT_FLAG_THRESHOLD:-3}" # 'not a bot' hits in one batch => flag the IP
+VPN_DNS="${VPN_DNS:-1.1.1.1}"                 # in-namespace resolver (the provider's own DNS
+                                              # rate-limits under WORKERS parallel namespaces).
+                                              # Still queried THROUGH the tunnel: no leak.
+
 # Circuit-breaker + setup-lock state files. Kept in /tmp (root-writable, shared
 # across all worker subshells).
 AUTH_PAUSE_FILE="${AUTH_PAUSE_FILE:-/tmp/ypcn_auth_pause}"
@@ -122,6 +140,8 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     BLOCK_BUDGET="$BLOCK_BUDGET" SETUP_WINDOW="$SETUP_WINDOW" STAGGER="$STAGGER" \
     SETTLE="$SETTLE" MAX_FAILS="$MAX_FAILS" MIN_SUBSET="$MIN_SUBSET" CAP="$CAP" \
     AUTH_COOLDOWN="$AUTH_COOLDOWN" \
+    COOLDOWN_MIN="$COOLDOWN_MIN" RECENT_SEC="$RECENT_SEC" LEASE_TTL="$LEASE_TTL" \
+    BOT_FLAG_THRESHOLD="$BOT_FLAG_THRESHOLD" VPN_DNS="$VPN_DNS" \
     VOPONO="$VOPONO" AUTH_PAUSE_FILE="$AUTH_PAUSE_FILE" SETUP_LOCK="$SETUP_LOCK" \
     "$0" "$SUBCMD" "$@"
 fi
@@ -141,6 +161,18 @@ mapfile -t WANTED_COUNTRIES < <(printf '%s\n' "${_countries_raw[@]}" | awk 'NF &
 NC_WANTED="${#WANTED_COUNTRIES[@]}"
 
 LOGDIR="$OUTPUT_DIR/logs/parallel"
+
+# Pool state (leases / cooldowns / recent marks), mutated only under POOL_LOCK.
+STATE_DIR="${STATE_DIR:-$OUTPUT_DIR/.ippool}"
+LEASE_DIR="$STATE_DIR/lease"; COOLDOWN_DIR="$STATE_DIR/cooldown"; RECENT_DIR="$STATE_DIR/recent"
+POOL_LOCK="$STATE_DIR/pool.lock"
+COOLDOWN_SEC=$(( COOLDOWN_MIN * 60 ))
+# vopono in-namespace DNS override (empty => leave vopono's default resolver).
+DNS_ARG=""; [[ -n "${VPN_DNS:-}" ]] && DNS_ARG="--dns $VPN_DNS"
+# Log substrings that each mean "YouTube flagged THIS exit IP" -> dormant. (403s
+# are counted separately: often transient CDN, so it takes BLOCK_BUDGET of them in
+# one batch to conclude the IP is burned.)
+BOT_RE='not a bot|VPN/Proxy Detected|HTTP Error 429'
 
 # ---------------------------------------------------------------------------
 # Preflight: fail fast and loud on anything that would make the long run abort
@@ -212,23 +244,91 @@ preflight() {
   return 0
 }
 
-# Load the server pool and group it by country. Sets the globals SRV (all pool
-# servers) and, per worker, the COUNTRY[i] it is pinned to. Each worker computes
-# its own rotation subset at launch (so WireGuard config presence is checked
-# there). Run this only after preflight has confirmed the pool exists.
+# Load the server pool into the global POOL: every server we can actually dial
+# (in WireGuard mode, only those we generated a --custom config for). This single
+# flat pool is what every worker leases from -- no per-worker country pinning.
+# Run this only after preflight has confirmed the pool file exists.
 load_pool() {
   mapfile -t SRV < <(grep -vE '^[[:space:]]*(#|$)' "$POOL_FILE" | awk '!seen[$0]++')
   (( ${#SRV[@]} > 0 )) || { echo "ERROR: server pool $POOL_FILE is empty." >&2; exit 1; }
 
-  # Warn if a worker's country is too shallow to rotate within.
-  local i c cn s
-  for (( i=0; i<WORKERS; i++ )); do
-    c="${WANTED_COUNTRIES[$i]}"; cn=0
-    for s in "${SRV[@]}"; do [[ "$(server_country "$s")" == "$c" ]] && cn=$(( cn + 1 )); done
-    (( cn >= 1 )) || echo ">> WARN: country '$c' has NO servers in $POOL_FILE -- worker $i will idle." >&2
-    (( cn >= 1 && cn < MIN_SUBSET )) && \
-      echo ">> WARN: country '$c' has only $cn server(s) to rotate within (< MIN_SUBSET=$MIN_SUBSET)." >&2
+  POOL=(); local s
+  for s in "${SRV[@]}"; do
+    [[ "$VPN_PROTOCOL" == "wireguard" && ! -f "$WG_DIR/$s.conf" ]] && continue
+    POOL+=("$s")
   done
+  POOL_N="${#POOL[@]}"
+  (( POOL_N >= WORKERS )) || {
+    echo "ERROR: only $POOL_N dialable server(s) in the pool but WORKERS=$WORKERS." \
+         "(WireGuard configs missing? run bin/setup.sh.)" >&2; exit 1; }
+
+  # Warn if a wanted country has too few servers to rotate within (the pool still
+  # works -- it just means that country contributes fewer fresh IPs).
+  local i c cn
+  for (( i=0; i<NC_WANTED; i++ )); do
+    c="${WANTED_COUNTRIES[$i]}"; cn=0
+    for s in "${POOL[@]}"; do [[ "$(server_country "$s")" == "$c" ]] && cn=$(( cn + 1 )); done
+    (( cn >= 1 )) || echo ">> WARN: country '$c' has NO dialable servers in the pool." >&2
+    (( cn >= 1 && cn < MIN_SUBSET )) && \
+      echo ">> WARN: country '$c' has only $cn dialable server(s) (< MIN_SUBSET=$MIN_SUBSET)." >&2
+  done
+}
+
+# --- pool primitives: atomic lease + dormancy (all state under POOL_LOCK) -----
+# claim_server: lease ONE server from the global pool. Guarantees no other worker
+# holds it concurrently; prefers a country no live worker is using (distinct
+# ranges); skips just-used (RECENT) and bot-flagged (dormant) servers. Echoes the
+# chosen token, or "" if every free server is momentarily dormant/recent.
+claim_server() {
+  exec 9>"$POOL_LOCK"; flock 9
+  local now; now=$(date +%s)
+  local lf bn mt
+  declare -A busy_country=()
+  for lf in "$LEASE_DIR"/*; do
+    [[ -e "$lf" ]] || continue
+    bn="$(basename "$lf")"; mt=$(stat -c %Y "$lf" 2>/dev/null || echo 0)
+    if (( now - mt > LEASE_TTL )); then rm -f "$lf"; continue; fi   # reclaim abandoned lease
+    busy_country["$(server_country "$bn")"]=1
+  done
+  local s mt2 cool recent base
+  local -a t0=() t1=() t2=()      # t0 distinct-country+fresh, t1 busy-country+fresh, t2 recent
+  for s in "${POOL[@]}"; do
+    [[ -e "$LEASE_DIR/$s" ]] && continue                 # in use -> never duplicate
+    cool=0
+    if [[ -e "$COOLDOWN_DIR/$s" ]]; then
+      mt=$(stat -c %Y "$COOLDOWN_DIR/$s" 2>/dev/null || echo 0)
+      (( now - mt < COOLDOWN_SEC )) && cool=1
+    fi
+    (( cool )) && continue                               # dormant -> strictly skipped
+    recent=0
+    if [[ -e "$RECENT_DIR/$s" ]]; then
+      mt2=$(stat -c %Y "$RECENT_DIR/$s" 2>/dev/null || echo 0)
+      (( now - mt2 < RECENT_SEC )) && recent=1
+    fi
+    base="$(server_country "$s")"
+    if   (( recent )); then t2+=("$s")
+    elif [[ -n "${busy_country[$base]:-}" ]]; then t1+=("$s")
+    else t0+=("$s"); fi
+  done
+  local pick=""
+  if   (( ${#t0[@]} )); then pick="$(printf '%s\n' "${t0[@]}" | shuf -n1)"
+  elif (( ${#t1[@]} )); then pick="$(printf '%s\n' "${t1[@]}" | shuf -n1)"
+  elif (( ${#t2[@]} )); then pick="$(printf '%s\n' "${t2[@]}" | shuf -n1)"
+  fi                                                     # all free servers dormant -> "" (worker waits)
+  [[ -n "$pick" ]] && touch "$LEASE_DIR/$pick"
+  flock -u 9; exec 9>&-
+  printf '%s' "$pick"
+}
+# release_server <server> <flagged 0|1>: free the lease, mark RECENT (no
+# back-to-back reuse) and, if flagged, DORMANT for COOLDOWN_MIN minutes.
+release_server() {
+  local s="$1" flagged="$2"
+  [[ -z "$s" ]] && return 0
+  exec 9>"$POOL_LOCK"; flock 9
+  [[ "$flagged" == "1" ]] && touch "$COOLDOWN_DIR/$s"
+  touch "$RECENT_DIR/$s"
+  rm -f "$LEASE_DIR/$s"
+  flock -u 9; exec 9>&-
 }
 
 # server_country <token> -- the country of a pool server token. Tokens look like
@@ -242,39 +342,18 @@ say() {  # say <wlog> <msg...> -- to the worker log (best-effort) AND supervisor
 }
 
 # ---------------------------------------------------------------------------
-# One worker: own ONE country, rotate within its servers, relaunch on a fresh
-# IP each batch. Runs the crawler INSIDE a vopono netns; the crawler itself
-# never touches the VPN.
+# One worker: lease a FRESH IP from the shared pool each batch (distinct from
+# every other live worker, not just-used, not dormant), run the crawler INSIDE
+# a vopono netns, then release the IP (flagging it dormant if it got bot-blocked).
+# The crawler itself never touches the VPN.
 # ---------------------------------------------------------------------------
 run_worker() {
   set +e                                     # manage exit codes explicitly; do not let
                                              # a tee/sleep failure kill the worker
   local i="$1" wlog="$LOGDIR/worker$1.out"
-  local mycountry="${WANTED_COUNTRIES[$i]}"
-
-  # Build this worker's rotation subset: the pool servers in its country. In
-  # WireGuard mode, only servers we actually generated a --custom config for.
-  local subset=() s
-  for s in "${SRV[@]}"; do
-    [[ "$(server_country "$s")" == "$mycountry" ]] || continue
-    if [[ "$VPN_PROTOCOL" == "wireguard" && ! -f "$WG_DIR/$s.conf" ]]; then continue; fi
-    subset+=("$s")
-  done
-  local m="${#subset[@]}"
-  if (( m == 0 )); then
-    say "$wlog" "[w$i] ABORT: no usable servers for country '$mycountry'" \
-                "(WireGuard configs missing? empty country in pool?)."
-    return 1
-  fi
-
-  local si=0 fails=0 noprog=0
-  # After cycling every IP a couple times with zero progress, the remaining ids
-  # look genuinely non-IP-blocked (network elsewhere); stop rather than spin.
-  local noprog_cap=$(( m * 2 ))
-  (( noprog_cap > 16 )) && noprog_cap=16
-  (( noprog_cap < 4 ))  && noprog_cap=4
+  local fails=0 noprog=0 noprog_cap=16
   RANDOM=$(( (i + 1) * 7919 ))               # per-worker seed so jitter desyncs workers
-  say "$wlog" "[w$i] shard $i/$WORKERS | country $mycountry | $m server(s) to rotate"
+  say "$wlog" "[w$i] shard $i/$WORKERS | global IP pool: $POOL_N servers, lease+${COOLDOWN_MIN}m dormancy"
 
   # The per-shard crawler command, as ONE shell-split string (vopono 0.10 takes
   # the application as a single argument, NOT a `-- cmd args` list). No `--vpn-*`
@@ -296,8 +375,20 @@ run_worker() {
       fi
     fi
 
-    local server="${subset[$(( si % m ))]}"; si=$(( si + 1 ))
-    say "$wlog" "[w$i] batch via $VPN_PROVIDER:$server ($VPN_PROTOCOL, shard $i/$WORKERS)"
+    # Lease an IP from the shared pool: distinct from every other live worker,
+    # not just-used, not dormant.
+    local server; server="$(claim_server)"
+    if [[ -z "$server" ]]; then
+      say "$wlog" "[w$i] pool momentarily empty (all leased/dormant); waiting"
+      sleep $(( SETTLE + RANDOM % 10 )); continue
+    fi
+    say "$wlog" "[w$i] batch via $VPN_PROVIDER:$server [$(server_country "$server")] ($VPN_PROTOCOL, shard $i/$WORKERS)"
+
+    # Snapshot block counters so we can tell, after the batch, whether THIS IP got
+    # bot-flagged (and should go dormant).
+    local nb0 f0
+    nb0=$(grep -cE "$BOT_RE" "$wlog" 2>/dev/null); : "${nb0:=0}"
+    f0=$(grep -c 'HTTP Error 403' "$wlog" 2>/dev/null); : "${f0:=0}"
 
     # Hold the global setup-lock ONLY while vopono builds its netns/veth + edits
     # NetworkManager (+ authenticates, for OpenVPN) -- the racy, not-concurrency-
@@ -306,13 +397,15 @@ run_worker() {
     exec 8>"$SETUP_LOCK"; flock 8
     if [[ "$VPN_PROTOCOL" == "wireguard" ]]; then
       # WireGuard: hand-built per-server config fed to vopono via --custom. No
-      # per-connection auth -> nothing for the provider to throttle.
-      "$VOPONO" exec --custom "$WG_DIR/$server.conf" --protocol wireguard \
+      # per-connection auth -> nothing for the provider to throttle. --dns
+      # overrides the in-namespace resolver (the provider's own DNS throttles
+      # under WORKERS parallel namespaces).
+      "$VOPONO" exec --custom "$WG_DIR/$server.conf" --protocol wireguard $DNS_ARG \
         --user "$RUN_USER" "$appcmd" >>"$wlog" 2>&1 &
     else
       # OpenVPN: provider + server name (full config name, e.g. south_korea-kr112).
       "$VOPONO" exec --provider "$VPN_PROVIDER" --protocol openvpn \
-        --server "$server" --user "$RUN_USER" "$appcmd" >>"$wlog" 2>&1 &
+        --server "$server" $DNS_ARG --user "$RUN_USER" "$appcmd" >>"$wlog" 2>&1 &
     fi
     local vp=$! held=0
     while (( held < SETUP_WINDOW )) && kill -0 "$vp" 2>/dev/null; do
@@ -321,15 +414,26 @@ run_worker() {
     flock -u 8; exec 8>&-
     wait "$vp"; local rc=$?
 
+    # Did this IP get bot-flagged / block-exhausted during the batch? If so, put
+    # it to sleep so no worker touches it for COOLDOWN_MIN minutes.
+    local nb1 f1 flagged=0
+    nb1=$(grep -cE "$BOT_RE" "$wlog" 2>/dev/null); : "${nb1:=0}"
+    f1=$(grep -c 'HTTP Error 403' "$wlog" 2>/dev/null); : "${f1:=0}"
+    if (( nb1 - nb0 >= BOT_FLAG_THRESHOLD )) || (( f1 - f0 >= BLOCK_BUDGET )); then
+      flagged=1
+      say "$wlog" "[w$i] FLAGGED $server (bot+$(( nb1 - nb0 )) / 403+$(( f1 - f0 ))) -> dormant ${COOLDOWN_MIN}m"
+    fi
+    release_server "$server" "$flagged"
+
     case "$rc" in
       64) say "$wlog" "[w$i] SHARD COMPLETE -- stopping worker."; return 0 ;;
-      0)  fails=0; noprog=0 ;;                         # progress -> rotate IP and continue
+      0)  fails=0; noprog=0 ;;                         # progress -> next IP
       75)                                              # batch downloaded nothing
         noprog=$(( noprog + 1 ))
-        say "$wlog" "[w$i] no downloads on $server (#$noprog/$noprog_cap); rotating IP."
+        say "$wlog" "[w$i] no downloads on $server (#$noprog/$noprog_cap); next IP."
         if (( noprog >= noprog_cap )); then
-          say "$wlog" "[w$i] STUCK: cycled all $m IP(s) x2 with zero progress; remaining ids " \
-                      "look non-IP-blocked. Stopping shard $i (re-run later to retry)."
+          say "$wlog" "[w$i] STUCK: $noprog_cap fresh IPs in a row, zero progress; remaining ids " \
+                      "look non-downloadable. Stopping shard $i (re-run later to retry)."
           return 2
         fi
         sleep $(( SETTLE + RANDOM % 12 )); continue ;;
@@ -346,7 +450,7 @@ run_worker() {
         say "$wlog" "[w$i] vopono/setup FAILURE on $server rc=$rc (#$fails/$MAX_FAILS)"
         if (( fails >= MAX_FAILS )); then
           say "$wlog" "[w$i] ABORT after $fails consecutive failures. Check: host off-VPN? " \
-                      "creds synced? connection cap? '$VPN_PROTOCOL' configs present?"
+                      "'$VPN_PROTOCOL' configs present? netns clean?"
           return 1
         fi
         # Exponential backoff, capped at 60s.
@@ -405,15 +509,19 @@ main() {
   echo " ids       : $IDS_FILE"
   echo " output    : $OUTPUT_DIR"
   echo " run-as    : root (netns); downloads owned by '$RUN_USER'; HOME=$HOME"
-  echo " workers   : $WORKERS (each pinned to a DISTINCT country), threads=$THREADS,"
+  echo " workers   : $WORKERS leasing from a SHARED pool (distinct live IPs), threads=$THREADS,"
   echo "             limit=$LIMIT dl/IP, block-budget=$BLOCK_BUDGET, $VPN_PROVIDER:$VPN_PROTOCOL"
-  echo " countries : ${WANTED_COUNTRIES[*]:0:$WORKERS}"
-  echo " pool      : ${#SRV[@]} server(s) in $POOL_FILE"
+  echo " alloc     : lease (no dup IPs) + ${RECENT_SEC}s no-reuse + ${COOLDOWN_MIN}m dormancy for flagged IPs; dns=${VPN_DNS:-default}"
+  echo " countries : ${WANTED_COUNTRIES[*]:0:$NC_WANTED}"
+  echo " pool      : $POOL_N dialable server(s) in $POOL_FILE"
   echo " logs      : $LOGDIR/worker<i>.out"
   echo
 
-  # Clear any stale auth cooldown from a previous run.
+  # Clear any stale auth cooldown from a previous run, and start the pool state
+  # FRESH (stale leases would otherwise shrink the pool until LEASE_TTL expires).
   rm -f "$AUTH_PAUSE_FILE" 2>/dev/null || true
+  rm -rf "$STATE_DIR" 2>/dev/null || true
+  mkdir -p "$LEASE_DIR" "$COOLDOWN_DIR" "$RECENT_DIR"
 
   pids=(); declare -A pid2shard
   trap cleanup INT TERM                       # install BEFORE launch (no untrapped window)

@@ -36,12 +36,18 @@ have to re-derive them.
 - Splits the work into `WORKERS` disjoint shards by `index % WORKERS` — no
   inter-worker coordination, fully resumable.
 - Runs each shard in its **own [vopono](https://github.com/jamesmcm/vopono)
-  network namespace**, pinned to its **own country**, so the live exit IPs sit in
-  `WORKERS` different `/16` ranges.
+  network namespace**, leasing one exit IP from a **shared pool** of all servers
+  across `COUNTRIES`.
+- The **lease allocator** gives four guarantees: no two workers ever hold the
+  **same IP** at once; the live IPs stay in **distinct countries** (so they sit in
+  `WORKERS` different `/16` ranges); a just-released IP is **not reused
+  back-to-back**; and an IP that trips YouTube's *"not a bot"* check goes
+  **dormant ~30 min** before it can be leased again.
 - Downloads audio + a `.meta` sidecar per video with `yt-dlp`, classifying every
   failure (block / permanent / transient) so retries and IP rotations are correct.
-- Rotates each worker to a fresh server **within its own country** after `LIMIT`
-  successful downloads — a new IP, same clean range.
+- Leases a **fresh IP each batch** (after `LIMIT` successful downloads), and uses
+  `--dns` so the in-namespace resolver doesn't choke under `WORKERS` parallel
+  namespaces.
 - The **host stays off the VPN entirely**. Only the worker namespaces are tunneled.
 
 ## Why per-worker distinct IPs, and why the host stays clean
@@ -129,18 +135,23 @@ be overridden inline, e.g. `WORKERS=4 ./crawl.sh`.
 | `COOKIES_FILE` | *(empty)* | Optional `cookies.txt`; bypasses many age/bot gates. |
 | `VPN_PROVIDER` | `nordvpn` | VPN provider (this repo is tuned for NordVPN). |
 | `VPN_PROTOCOL` | `wireguard` | `wireguard` (recommended, no auth throttle) or `openvpn`. |
-| `COUNTRIES` | `south_korea japan singapore …` | Space-separated, **one distinct country per worker**. Use names as `vopono servers nordvpn` lists them. Must have **≥ `WORKERS`** entries. |
+| `VPN_DNS` | `1.1.1.1` | In-namespace resolver (through the tunnel — no leak). The provider's own DNS rate-limits under `WORKERS` parallel namespaces. Empty = vopono default. |
+| `COUNTRIES` | `south_korea japan singapore …` | Space-separated countries the shared IP pool draws from. The allocator keeps live IPs in **distinct** countries, so give it **≥ `WORKERS`** entries. Use names as `vopono servers nordvpn` lists them. |
 | `WORKERS` | `8` | Parallel workers. **≤ number of `COUNTRIES`** and **≤ 9** (NordVPN's 10-connection cap). |
 | `THREADS` | `2` | Within-worker concurrency per IP. `2` is YouTube-safe; `>2` trips the per-IP detector. |
 | `LIMIT` | `60` | Successful downloads per IP before rotating to the next server. |
-| `BLOCK_BUDGET` | `20` | Per-IP blocks tolerated before ending a batch early (most 403s are transient). |
+| `BLOCK_BUDGET` | `20` | Per-IP blocks tolerated before ending a batch early; also the 403-count in a batch that marks an IP bot-flagged → dormant. |
 | `SETUP_WINDOW` | `8` | Seconds the global setup-lock is held per worker (WireGuard ~5–8; OpenVPN ~20). |
 | `STAGGER` | `8` | Seconds between initial worker launches. |
 | `SETTLE` | `3` | Base seconds between a teardown and the next spawn (jittered). |
 | `MAX_FAILS` | `8` | Consecutive setup failures before a worker aborts its shard. |
-| `MIN_SUBSET` | `3` | Minimum distinct servers a worker must cycle before reusing an IP. |
+| `MIN_SUBSET` | `3` | Warn if a country has fewer than this many dialable servers. |
 | `CAP` | `9` | NordVPN simultaneous-connection ceiling to honor. |
 | `AUTH_COOLDOWN` | `150` | OpenVPN only: global fleet pause (s) when auth throttling is detected. |
+| `COOLDOWN_MIN` | `30` | Minutes a bot-flagged IP stays **dormant** before it can be leased again. |
+| `RECENT_SEC` | `180` | Seconds a just-released IP is held out (no back-to-back reuse). |
+| `LEASE_TTL` | `1800` | Seconds after which an abandoned lease (crashed worker) is reclaimed. |
+| `BOT_FLAG_THRESHOLD` | `3` | `not a bot` hits within one batch that flag the IP → dormant. |
 | `POOL_FILE` | `./servers.txt` | Generated server pool (written by `setup.sh`). |
 | `WG_DIR` | `/etc/wireguard/nordwg` | Generated per-server WireGuard configs (root-owned). |
 | `VENV` | `./.venv` | Python venv holding `yt-dlp`. |
@@ -156,9 +167,18 @@ the namespace sees the VPN. `vopono` runs as root (netns requires it) but with
 `--user $RUN_USER` so the downloaded files stay owned by you, and `crawl.sh`
 forwards `HOME` so `vopono` finds the config you synced.
 
-**Country pinning.** Worker `i` is pinned to `COUNTRIES[i]` and rotates **only
-within that country's servers**. So the `WORKERS` live IPs are always in
-`WORKERS` distinct ranges — the diversity that defeats subnet-level bot detection.
+**Shared IP pool with leasing.** All dialable servers across `COUNTRIES` form one
+pool. Each batch a worker **leases** a server under a `flock`'d lock that enforces:
+*(1)* **no duplicate IPs** — a leased server is excluded from every other worker,
+so the `WORKERS` live IPs are always distinct; *(2)* **distinct ranges** — the
+allocator prefers a server whose country no live worker holds, keeping the live
+IPs in `WORKERS` different `/16`s (the diversity that defeats subnet-level bot
+detection); *(3)* **no back-to-back reuse** — a just-released IP is held out for
+`RECENT_SEC`; *(4)* **dormancy** — an IP that trips `not a bot`/≥`BLOCK_BUDGET`
+403s in a batch is quarantined for `COOLDOWN_MIN` minutes and never handed back
+early. A crashed worker's lease is reclaimed after `LEASE_TTL` so the pool never
+shrinks. (This replaced naive per-worker country pinning, which couldn't quarantine
+a burned IP or guarantee no two workers shared a range.)
 
 **Sharding.** The id list is split by `index % WORKERS`; worker `i` processes
 only the lines where `index % WORKERS == i`. No locking, no coordination.
