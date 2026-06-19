@@ -443,7 +443,7 @@ run_worker() {
           connfails=$(( connfails + 1 ))
           local e=$(( connfails > 6 ? 6 : connfails ))
           local cb=$(( SETTLE * (1 << e) )); (( cb > 120 )) && cb=120
-          say "$wlog" "[w$i] NO CONNECTIVITY on $server (#$connfails) -> backoff ${cb}s (tunnel/provider issue; not counting toward STUCK)"
+          say "$wlog" "[w$i] NO CONNECTIVITY on $server (#$connfails) -> backoff ${cb}s (tunnel/provider issue; not a give-up strike)"
           sleep $(( cb + RANDOM % 8 )); continue
         fi
         connfails=0
