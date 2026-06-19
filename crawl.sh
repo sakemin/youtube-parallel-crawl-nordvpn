@@ -173,6 +173,13 @@ DNS_ARG=""; [[ -n "${VPN_DNS:-}" ]] && DNS_ARG="--dns $VPN_DNS"
 # are counted separately: often transient CDN, so it takes BLOCK_BUDGET of them in
 # one batch to conclude the IP is burned.)
 BOT_RE='not a bot|VPN/Proxy Detected|HTTP Error 429'
+# Log substrings meaning the TUNNEL had no connectivity (NOT YouTube blocking the
+# IP). A whole batch failing this way is SYSTEMIC (provider dropped WG handshakes,
+# host net blip). The worker then backs off EXPONENTIALLY instead of rotating in a
+# storm -- a storm of fresh handshakes is exactly what trips NordVPN's WireGuard
+# rate-limit and keeps it tripped. Does NOT count toward the per-shard STUCK cap,
+# so the worker waits the outage out and self-heals when connectivity returns.
+CONN_RE='Temporary failure in name resolution|Failed to resolve|Connection refused|Network is unreachable|No route to host|Connection timed out|timed out\.'
 
 # ---------------------------------------------------------------------------
 # Preflight: fail fast and loud on anything that would make the long run abort
@@ -351,7 +358,7 @@ run_worker() {
   set +e                                     # manage exit codes explicitly; do not let
                                              # a tee/sleep failure kill the worker
   local i="$1" wlog="$LOGDIR/worker$1.out"
-  local fails=0 noprog=0 noprog_cap=16
+  local fails=0 noprog=0 noprog_cap=16 connfails=0
   RANDOM=$(( (i + 1) * 7919 ))               # per-worker seed so jitter desyncs workers
   say "$wlog" "[w$i] shard $i/$WORKERS | global IP pool: $POOL_N servers, lease+${COOLDOWN_MIN}m dormancy"
 
@@ -427,8 +434,19 @@ run_worker() {
 
     case "$rc" in
       64) say "$wlog" "[w$i] SHARD COMPLETE -- stopping worker."; return 0 ;;
-      0)  fails=0; noprog=0 ;;                         # progress -> next IP
+      0)  fails=0; noprog=0; connfails=0 ;;            # progress -> next IP
       75)                                              # batch downloaded nothing
+        # Systemic connectivity failure (dead tunnel / provider dropped handshakes)
+        # vs genuinely non-downloadable ids. The former must NOT trigger a rotation
+        # storm: back off exponentially and wait it out WITHOUT counting toward STUCK.
+        if tail -n 50 "$wlog" 2>/dev/null | grep -qE "$CONN_RE"; then
+          connfails=$(( connfails + 1 ))
+          local e=$(( connfails > 6 ? 6 : connfails ))
+          local cb=$(( SETTLE * (1 << e) )); (( cb > 120 )) && cb=120
+          say "$wlog" "[w$i] NO CONNECTIVITY on $server (#$connfails) -> backoff ${cb}s (tunnel/provider issue; not counting toward STUCK)"
+          sleep $(( cb + RANDOM % 8 )); continue
+        fi
+        connfails=0
         noprog=$(( noprog + 1 ))
         say "$wlog" "[w$i] no downloads on $server (#$noprog/$noprog_cap); next IP."
         if (( noprog >= noprog_cap )); then
