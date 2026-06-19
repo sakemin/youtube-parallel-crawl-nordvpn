@@ -305,6 +305,69 @@ few clean isolated IPs," a proxy pool for hundreds.
 failure-classification skeleton is reusable. Swap the `yt-dlp` invocation and the
 block/permanent/transient string matches in `crawler/crawler.py`.
 
+### Failure scenarios (what each looks like, and what to do)
+
+These are the walls you actually hit at scale, in the order they tend to appear.
+The defenses below are all built in — this is for understanding *why* throughput
+moves the way it does.
+
+**Throughput was high, then ALL tunnels die at once (`wg show` → `0 B received`,
+`handshake=NONE` on every server) — but the host can still ping the endpoint.**
+This is the big one. NordVPN **rate-limited your account's WireGuard handshakes**.
+The shared pool deliberately spreads across many distinct servers for IP
+diversity, and that means *many distinct handshakes* — and once a few tunnels go
+dead, workers rotate faster and faster trying to find a live one (a "rotation
+storm" — we measured ~32 distinct servers in 5 minutes), which is exactly the
+pattern NordVPN throttles, so it stays tripped at 0. Defenses: (1) the **`CONN_RE`
+connectivity-aware exponential backoff** — a batch that fails with *connectivity*
+errors (not YouTube blocks) backs off up to 120 s instead of rotating, so the
+fleet quiets down, the limit resets, and it **self-heals**; (2) raise **`LIMIT`**
+(more downloads per IP → fewer handshakes); (3) if it still recurs, shrink the
+working set (fewer `COUNTRIES`, or fewer servers per country in the pool) so you
+re-use IPs more. If you're impatient, stop the fleet for 1–2 minutes and restart.
+
+**Downloads crawl, logs full of `Temporary failure in name resolution`.** The
+provider's own DNS rate-limits under `WORKERS` parallel namespaces. Set
+**`VPN_DNS=1.1.1.1`** (or `8.8.8.8`) — it's queried *through* the tunnel, so the
+exit IP is unchanged and nothing leaks. (Distinct from the handshake rate-limit
+above: there the *tunnel* is dead; here the tunnel is up but DNS is throttled.)
+
+**`Sign in to confirm you're not a bot` on most requests.** Subnet-level
+detection: too many workers in one provider `/24`. Spread across more
+`COUNTRIES` — the allocator keeps the live IPs in distinct ranges. **Diversity
+beats rotation frequency.**
+
+**Still seeing `VPN/Proxy Detected` / occasional bot blocks even with diverse,
+rotating IPs — can I get to zero?** Not with a commercial VPN: NordVPN's ranges
+are *known* datacenter IPs, so YouTube flags a fraction no matter how you rotate.
+The **dormancy** mechanism quarantines the worst offenders for `COOLDOWN_MIN`, so
+throughput recovers, but a low background level remains. The only way to ~zero is
+**authenticated requests**: set `COOKIES_FILE` to a `cookies.txt` exported from a
+logged-in session (use a throwaway account — heavy automated use can flag it).
+
+**The whole fleet collapsed to ~0 and the logs say `authentication failed`
+(OpenVPN).** OpenVPN's per-connection auth gets rate-limited under parallel
+reconnect churn → retry cascade. Don't tune OpenVPN — **use
+`VPN_PROTOCOL=wireguard`** (static key, no per-connection auth). This is
+architecture, not parameters.
+
+**Two workers seem to be on the same IP or same country.** They shouldn't be —
+the `flock`'d lease excludes a server from every other worker and prefers an
+unused country. If you see it, you have fewer dialable servers than `WORKERS`
+(check `bin/verify.sh`) or `COUNTRIES < WORKERS`.
+
+**A shard logged `STUCK` / a worker exited — did I lose data?** No. Everything is
+resumable from disk: a downloaded file or a permanent-fail marker prunes that id
+on the next run. `STUCK` means that shard cycled many fresh IPs with zero
+progress, so its *remaining* ids look genuinely non-downloadable (private/removed/
+age-gated). Just re-run `./crawl.sh` to retry the rest.
+
+**How do I trade throughput against getting blocked?** `LIMIT` is the main dial:
+**higher** = fewer WireGuard handshakes (safer for NordVPN) but more downloads per
+IP (more YouTube per-IP exposure); **lower** = the reverse. `BLOCK_BUDGET` caps how
+many blocks an IP absorbs before its batch ends early (and, at that count, marks it
+dormant). Keep `THREADS=2` — `>2` trips YouTube's *per-IP* concurrency detector.
+
 ---
 
 ## Use as a Claude Code skill

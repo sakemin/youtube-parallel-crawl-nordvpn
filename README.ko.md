@@ -193,7 +193,7 @@ $VENV/bin/python crawler/crawler.py IDS_FILE OUTPUT_DIR \
 
 ## 어렵게 얻은 사실들 (반드시 지킬 것)
 
-이 프로젝트가 다일(multi-day) 실제 운영에서 단련되며 가장 많은 시간을 잡아먹은 비자명한 네 개의 벽입니다. 동작하는 설정에서 출발하고, 다시 유도하지 마세요.
+이 프로젝트가 다일(multi-day) 실제 운영에서 단련되며 가장 많은 시간을 잡아먹은 비자명한 일곱 개의 벽입니다. 동작하는 설정에서 출발하고, 다시 유도하지 마세요.
 
 ### 벽 1 — 약 86%가 "Sign in to confirm you're not a bot"
 - **원인:** W개의 워커가 한 제공자의 /24에 몰리면 YouTube의 서브넷 단위 남용 탐지가 그 /24 전체를 플래그합니다. (같은 IP들을 **한 번에 하나씩** 쓰면 약 1.5%였습니다.) 제공자의 같은 국가 서버는 의외로 적은 수의 /24에 모여 있습니다(NordVPN KR = 약 5개 /24).
@@ -214,6 +214,20 @@ $VENV/bin/python crawler/crawler.py IDS_FILE OUTPUT_DIR \
 - **원인 B (진짜 차단 요인):** **AppArmor** `wg` 프로파일이 vopono가 설정을 복사해 두는 `/tmp` 읽기를 막음. 증상은 `fopen: Permission denied` + 조용한 NO_HANDSHAKE. `dmesg | grep -i 'apparmor.*DENIED.*wg'`로 확인.
 - **해결:** `echo '/tmp/vopono*.conf r,' >> /etc/apparmor.d/local/wg && apparmor_parser -r /etc/apparmor.d/wg` (`bin/setup.sh`가 자동으로 수행).
 - **토큰 불필요:** 계정에 등록된 WireGuard 개인 키는 이미 호스트에 있습니다 — `sudo wg show nordlynx private-key`. 각 서버의 WG **공개 키 + 엔드포인트**는 **공개** API `https://api.nordvpn.com/v1/servers?limit=8000`에서 옵니다(서버별 `technologies[].identifier=="wireguard_udp"` → `metadata`의 `public_key`, Endpoint = `station:51820`). 설정: `Address=10.5.0.2/32`, `AllowedIPs=0.0.0.0/0`, `DNS=103.86.96.100`. `bin/setup.sh`가 이를 모두 처리해 `WG_DIR`에 서버별 설정을 만듭니다.
+
+### 벽 5 — 다운로드가 느려지며 `Temporary failure in name resolution` 폭증
+- **원인:** 제공자(NordVPN) **자체 DNS가 `WORKERS`개 병렬 네임스페이스의 질의량에 rate-limit**. 터널은 살아있는데 이름 해석만 막혀 처리량이 무너집니다.
+- **해결:** vopono `--dns 1.1.1.1`(`VPN_DNS`). 질의는 **터널을 통해** 나가므로 exit IP는 그대로이고 누출도 없습니다. (벽 7과 구분: 거기선 *터널 자체*가 죽습니다.)
+
+### 벽 6 — country-pinning은 너무 나이브 → 공유 IP 풀 (리스 + 휴면)
+- **문제:** 워커를 한 국가에 **고정**하면 (a) 두 워커가 같은 IP를 동시에 쓸 수 있고, (b) 플래그된(차단된) IP를 잠시 격리할 방법이 없습니다.
+- **해결:** 모든 워커가 **하나의 공유 풀에서 IP를 리스(lease)**. `flock`으로 4가지를 보장 — ① 동시 중복 IP 없음 ② 라이브 IP는 서로 다른 국가(distinct /16) ③ 막 반납한 IP는 즉시 재사용 금지(`RECENT_SEC`) ④ 봇-플래그된 IP는 `COOLDOWN_MIN`분 **휴면**(절대 조기 재배정 안 함). 크래시한 워커의 리스는 `LEASE_TTL` 후 회수. 플래그 신호 = 한 배치당 `not a bot | VPN/Proxy Detected | HTTP 429` 누적 ≥ `BOT_FLAG_THRESHOLD` **또는** 403 ≥ `BLOCK_BUDGET`.
+- **핵심 함정:** **"VPN/Proxy Detected"가 "not a bot"보다 흔한 차단 신호** — 둘 다 잡아야 휴면이 제대로 작동합니다. 봇 탐지는 0이 아니라 **저-중 수준**으로 남습니다(상용 VPN IP는 본질적으로 일부 플래그됨); 휴면이 최악의 IP만 격리해 처리량을 회복시킬 뿐, 완전 제거는 **쿠키**(`COOKIES_FILE`, 인증 요청)뿐입니다.
+
+### 벽 7 — 잘 돌다가 ~1시간 후 전 터널 사망 (`wg show` = `0 B received` / `handshake=NONE`)
+- **증상:** 모든 서버에서 핸드셰이크 0바이트 수신인데, **호스트는** 엔드포인트에 ICMP/UDP 51820 정상 도달.
+- **원인:** NordVPN이 **계정의 WireGuard 핸드셰이크를 rate-limit**. 공유 풀은 다양성을 위해 distinct 서버를 많이 churn → 핸드셰이크가 많음(옛 country-pinning은 서버를 재사용해 14시간 버팀). 결정타는 터널이 죽은 뒤 워커들이 살아있는 서버를 찾아 **미친 듯이 회전하는 폭주**(측정: 5분에 32 distinct 서버) — 바로 이 패턴이 리밋을 트리거하고 0에 **고착**시킵니다.
+- **해결:** **연결실패 지수 백오프**(`CONN_RE`) — 배치가 (YouTube 차단이 아닌) *연결* 오류로 통째로 실패하면 최대 120초 백오프하고 STUCK 카운트에서 제외 → 폭주 대신 조용히 대기 → 리밋이 리셋되고 다운로드 **자가 회복**. 추가로 `LIMIT` 상향(기본 핸드셰이크 빈도 감소), 그래도 재발하면 풀/`COUNTRIES` 축소로 IP 재사용을 늘립니다. 급하면 함대를 1~2분 정지 후 재시작하면 리밋이 풀립니다.
 
 ### vopono 주의점 (버전 0.10.x)
 - 애플리케이션은 **하나의 인자**입니다(vopono가 shell-split). `-- cmd args`가 아니라 `vopono exec ... "yt-dlp -x URL"` 형태. 따옴표 없는 `-x`/`-s`는 vopono 플래그로 파싱됩니다.
