@@ -318,13 +318,18 @@ The shared pool deliberately spreads across many distinct servers for IP
 diversity, and that means *many distinct handshakes* — and once a few tunnels go
 dead, workers rotate faster and faster trying to find a live one (a "rotation
 storm" — we measured ~32 distinct servers in 5 minutes), which is exactly the
-pattern NordVPN throttles, so it stays tripped at 0. Defenses: (1) the **`CONN_RE`
-connectivity-aware exponential backoff** — a batch that fails with *connectivity*
-errors (not YouTube blocks) backs off up to 120 s instead of rotating, so the
-fleet quiets down, the limit resets, and it **self-heals**; (2) raise **`LIMIT`**
-(more downloads per IP → fewer handshakes); (3) if it still recurs, shrink the
-working set (fewer `COUNTRIES`, or fewer servers per country in the pool) so you
-re-use IPs more. If you're impatient, stop the fleet for 1–2 minutes and restart.
+pattern NordVPN throttles, so it stays tripped at 0. Defenses, all built in:
+(1) **`PER_COUNTRY_CAP`** bounds the pool to N servers per country (default 15 →
+~100 total instead of 400+), so the fleet re-uses IPs and emits far fewer distinct
+handshakes — the limit is hit *much* less often; (2) the crawler's **dead-exit
+circuit breaker** (`--max-consec-fail`) ends a batch after a run of consecutive
+failures with zero downloads — a dead tunnel fails every id with `name resolution`,
+which is *not* a "block", so without this the batch would grind the whole shard at
+0 and the backoff below would never even get to fire; (3) the **`CONN_RE`
+connectivity-aware exponential backoff** then backs off up to 120 s instead of
+rotating, so the fleet quiets down, the limit resets, and it **self-heals**;
+(4) raise **`LIMIT`** (more downloads per IP → fewer handshakes). If you're
+impatient, stop the fleet for 1–2 minutes and restart.
 
 **Downloads crawl, logs full of `Temporary failure in name resolution`.** The
 provider's own DNS rate-limits under `WORKERS` parallel namespaces. Set

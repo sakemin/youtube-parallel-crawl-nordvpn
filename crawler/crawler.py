@@ -386,6 +386,7 @@ def crawl(args):
         "blocks": 0,                   # per-IP blocks this batch
         "done": 0,                     # terminal ids (not re-queued)
         "retries": 0,                  # block re-queues
+        "consec_fail": 0,              # consecutive failures w/ 0 downloads -> dead exit
     }
     counts = {}                        # status -> count, for the summary
     attempts = {}                      # yt_id -> block-retry attempts
@@ -430,6 +431,9 @@ def crawl(args):
                     counts["blocked"] = counts.get("blocked", 0) + 1
                     budget_spent = (args.block_budget > 0
                                     and state["blocks"] >= args.block_budget)
+                    state["consec_fail"] += 1
+                    dead_exit = (state["downloaded"] == 0
+                                 and state["consec_fail"] >= args.max_consec_fail)
                 if over:
                     # Give up on this id for this batch but DON'T mark it: it is a
                     # block, not a permanent failure. It stays in the file and is
@@ -437,17 +441,32 @@ def crawl(args):
                     record(yt_id, "blocked-gaveup", terminal=True)
                 else:
                     work.put(yt_id)
-                if budget_spent:
+                if budget_spent or dead_exit:
                     stop.set()
                 continue
 
             terminal = True
             record(yt_id, status, terminal=terminal)
-            if status == "downloaded":
-                with lock:
+            # Dead-exit circuit breaker: a long run of consecutive failures with
+            # ZERO downloads means the tunnel is dead (every id fails with "name
+            # resolution") or the IP is fully blocked. End the batch FAST so the
+            # supervisor backs off / rotates instead of grinding the shard at 0
+            # (DNS failures aren't 'blocks', so block-budget never trips).
+            with lock:
+                if status == "downloaded":
                     state["downloaded"] += 1
+                    state["consec_fail"] = 0
                     if args.limit > 0 and state["downloaded"] >= args.limit:
                         stop.set()      # per-IP budget reached -> supervisor rotates
+                else:
+                    state["consec_fail"] += 1
+                    if (state["downloaded"] == 0
+                            and state["consec_fail"] >= args.max_consec_fail
+                            and not stop.is_set()):
+                        print(f"\n!! dead exit: {state['consec_fail']} consecutive "
+                              f"failures, 0 downloads -> ending batch early so the IP "
+                              f"rotates.", flush=True)
+                        stop.set()
 
     threads = [threading.Thread(target=worker, name=f"w{shard}.{i}")
                for i in range(max(1, args.threads))]
@@ -510,6 +529,13 @@ def build_parser():
     parser.add_argument("--block-budget", type=int, default=0,
                         help="End the batch after N per-IP blocks so the supervisor "
                              "rotates to a fresh IP (0 = unlimited).")
+    parser.add_argument("--max-consec-fail", type=int, default=25,
+                        help="Dead-exit circuit breaker: end the batch after N "
+                             "consecutive failures with ZERO downloads. A dead tunnel "
+                             "fails every id with 'name resolution', which is not a "
+                             "'block', so block-budget never trips and the batch would "
+                             "otherwise grind the whole shard at 0. Ending fast lets the "
+                             "supervisor back off / rotate.")
     parser.add_argument("--max-retries", type=int, default=4,
                         help="Max block re-queues for a single id within one batch "
                              "before giving up on it for this batch (no marker).")

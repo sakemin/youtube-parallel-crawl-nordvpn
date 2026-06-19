@@ -59,7 +59,7 @@ REPO="$HERE"
 _ypcn_keys=(IDS_FILE OUTPUT_DIR YTDLP_FORMAT COOKIES_FILE VPN_PROVIDER VPN_PROTOCOL
   COUNTRIES WORKERS THREADS LIMIT BLOCK_BUDGET SETUP_WINDOW STAGGER SETTLE
   MAX_FAILS MIN_SUBSET CAP AUTH_COOLDOWN POOL_FILE WG_DIR VENV
-  COOLDOWN_MIN RECENT_SEC LEASE_TTL BOT_FLAG_THRESHOLD VPN_DNS)
+  COOLDOWN_MIN RECENT_SEC LEASE_TTL BOT_FLAG_THRESHOLD VPN_DNS PER_COUNTRY_CAP)
 _ypcn_ovr=()
 for _k in "${_ypcn_keys[@]}"; do [[ -n "${!_k+x}" ]] && _ypcn_ovr+=("$_k=${!_k}"); done
 # shellcheck source=/dev/null
@@ -116,6 +116,12 @@ BOT_FLAG_THRESHOLD="${BOT_FLAG_THRESHOLD:-3}" # 'not a bot' hits in one batch =>
 VPN_DNS="${VPN_DNS:-1.1.1.1}"                 # in-namespace resolver (the provider's own DNS
                                               # rate-limits under WORKERS parallel namespaces).
                                               # Still queried THROUGH the tunnel: no leak.
+PER_COUNTRY_CAP="${PER_COUNTRY_CAP:-0}"       # cap servers per country in the pool (0=all).
+                                              # Bounds DISTINCT WireGuard handshakes: cycling
+                                              # hundreds of distinct servers trips NordVPN's
+                                              # per-account WG handshake rate-limit. A bounded
+                                              # set (e.g. 15/country) reuses IPs -> far fewer
+                                              # distinct handshakes, still diverse for YouTube.
 
 # Circuit-breaker + setup-lock state files. Kept in /tmp (root-writable, shared
 # across all worker subshells).
@@ -142,6 +148,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     AUTH_COOLDOWN="$AUTH_COOLDOWN" \
     COOLDOWN_MIN="$COOLDOWN_MIN" RECENT_SEC="$RECENT_SEC" LEASE_TTL="$LEASE_TTL" \
     BOT_FLAG_THRESHOLD="$BOT_FLAG_THRESHOLD" VPN_DNS="$VPN_DNS" \
+    PER_COUNTRY_CAP="$PER_COUNTRY_CAP" \
     VOPONO="$VOPONO" AUTH_PAUSE_FILE="$AUTH_PAUSE_FILE" SETUP_LOCK="$SETUP_LOCK" \
     "$0" "$SUBCMD" "$@"
 fi
@@ -259,9 +266,14 @@ load_pool() {
   mapfile -t SRV < <(grep -vE '^[[:space:]]*(#|$)' "$POOL_FILE" | awk '!seen[$0]++')
   (( ${#SRV[@]} > 0 )) || { echo "ERROR: server pool $POOL_FILE is empty." >&2; exit 1; }
 
-  POOL=(); local s
+  POOL=(); local s c; local -A _ccnt=()
   for s in "${SRV[@]}"; do
     [[ "$VPN_PROTOCOL" == "wireguard" && ! -f "$WG_DIR/$s.conf" ]] && continue
+    if (( PER_COUNTRY_CAP > 0 )); then
+      c="$(server_country "$s")"
+      (( ${_ccnt[$c]:-0} >= PER_COUNTRY_CAP )) && continue
+      _ccnt[$c]=$(( ${_ccnt[$c]:-0} + 1 ))
+    fi
     POOL+=("$s")
   done
   POOL_N="${#POOL[@]}"
