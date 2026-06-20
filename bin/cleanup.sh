@@ -4,13 +4,15 @@
 #
 # vopono builds one network namespace + veth pair per worker and edits a single
 # shared NetworkManager file (conf.d/unmanaged.conf). A hard kill leaves these
-# behind: orphan vo_nd_* netns/veths and a stale unmanaged.conf whose missing
+# behind: orphan vopono netns/veths and a stale unmanaged.conf whose missing
 # backup is exactly what makes the NEXT concurrent vopono start panic
 # ("Failed to restore backup of NetworkManager unmanaged.conf: NotFound").
 # This script kills the supervisor + vopono/OpenVPN cleanly, deletes the orphan
-# vo_nd_* interfaces/namespaces, and resets unmanaged.conf.
+# vo_nd_* (provider/OpenVPN) AND vo_c_* (WireGuard --custom) interfaces/namespaces,
+# and resets unmanaged.conf. (Cleaning only vo_nd_* lets stale WireGuard vo_c_*
+# veths pile up until 'RTNETLINK: File exists' collisions abort workers.)
 #
-# Safe for the host: it only touches vo_nd_* interfaces and RELOADS (never
+# Safe for the host: it only touches vopono (vo_*) interfaces and RELOADS (never
 # restarts) NetworkManager, so the host's WiFi / SSH / agent session stays up.
 # The host is never on the VPN, so nothing here changes the host's route.
 #
@@ -53,14 +55,17 @@ sleep 1
 # vopono's own teardown is the preferred path when it still works; best-effort.
 "$VOPONO" list namespaces >/dev/null 2>&1 || true
 
-echo ">> deleting orphaned vopono network namespaces (vo_nd_*)..."
-ip netns list 2>/dev/null | awk '/vo_nd/{print $1}' | while read -r n; do
+echo ">> deleting orphaned vopono network namespaces (vo_nd_* + vo_c_*)..."
+ip netns list 2>/dev/null | awk '/vo_(nd|c)_/{print $1}' | while read -r n; do
   ip netns delete "$n" 2>/dev/null && echo "   netns $n"
 done
 
-echo ">> deleting orphaned vopono veth interfaces (vo_nd_*)..."
+echo ">> deleting orphaned vopono veth interfaces (vo_nd_* + vo_c_*)..."
 # 'ip -br link' prints "name@peer"; strip the @peer and de-dup before deleting.
-ip -br link 2>/dev/null | awk '/vo_nd/{print $1}' | sed 's/@.*//' | sort -u | while read -r l; do
+# vo_nd_* = provider/OpenVPN mode; vo_c_* = WireGuard --custom mode. Missing vo_c_*
+# lets stale WireGuard veths accumulate across hard-kills until 'RTNETLINK: File
+# exists' veth collisions abort workers.
+ip -br link 2>/dev/null | awk '/vo_(nd|c)_/{print $1}' | sed 's/@.*//' | sort -u | while read -r l; do
   ip link del "$l" 2>/dev/null && echo "   link $l"
 done
 
@@ -75,12 +80,12 @@ systemctl reload NetworkManager 2>/dev/null \
 # clean (names must match crawl.sh's AUTH_PAUSE_FILE / SETUP_LOCK defaults).
 rm -f "${AUTH_PAUSE_FILE:-/tmp/ypcn_auth_pause}" "${SETUP_LOCK:-/tmp/ypcn_setup.lock}" 2>/dev/null || true
 
-left="$(ip -br link 2>/dev/null | grep -c vo_nd)"
-echo ">> remaining vo_nd interfaces: $left  (want 0)"
+left="$(ip -br link 2>/dev/null | grep -cE 'vo_(nd|c)_')"
+echo ">> remaining vopono (vo_nd_*/vo_c_*) interfaces: $left  (want 0)"
 if [[ "$left" == "0" ]]; then
   echo ">> CLEAN. Restart with:  sudo ./crawl.sh"
 else
-  echo ">> WARN: some vo_nd interfaces remain; re-run, or delete by hand:" >&2
-  echo "          ip -br link | grep vo_nd   then   sudo ip link del <name>" >&2
+  echo ">> WARN: some vopono interfaces remain; re-run, or delete by hand:" >&2
+  echo "          ip -br link | grep -E 'vo_(nd|c)_'   then   sudo ip link del <name>" >&2
   exit 1
 fi
