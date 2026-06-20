@@ -220,11 +220,14 @@ preflight() {
     ok=0
   fi
 
-  # One distinct country per worker.
+  # Distinct country per worker is a PREFERENCE, not a hard rule: with the shared
+  # pool, if WORKERS > distinct COUNTRIES the extra worker(s) lease a server in an
+  # already-used country -- still a DISTINCT IP (the lease forbids duplicates), just
+  # a weaker distinct-/16 guarantee for those. Warn rather than abort.
   if (( NC_WANTED < WORKERS )); then
-    echo "ERROR: only $NC_WANTED distinct COUNTRIES but WORKERS=$WORKERS -- each worker " \
-         "needs its own country/range. Add countries to COUNTRIES in config.env." >&2
-    ok=0
+    echo ">> WARN: only $NC_WANTED distinct COUNTRIES but WORKERS=$WORKERS -- $(( WORKERS - NC_WANTED )) " \
+         "worker(s) will share a country (distinct IP via the lease, weaker /16 isolation). " \
+         "Add countries to COUNTRIES in config.env for full isolation." >&2
   fi
 
   # WireGuard mode needs per-server configs in WG_DIR.
