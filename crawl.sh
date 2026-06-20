@@ -175,7 +175,8 @@ LEASE_DIR="$STATE_DIR/lease"; COOLDOWN_DIR="$STATE_DIR/cooldown"; RECENT_DIR="$S
 POOL_LOCK="$STATE_DIR/pool.lock"
 COOLDOWN_SEC=$(( COOLDOWN_MIN * 60 ))
 # vopono in-namespace DNS override (empty => leave vopono's default resolver).
-DNS_ARG=""; [[ -n "${VPN_DNS:-}" ]] && DNS_ARG="--dns $VPN_DNS"
+DNS_ARGS=()
+[[ -n "${VPN_DNS:-}" ]] && DNS_ARGS=(--dns "$VPN_DNS")
 # Log substrings that each mean "YouTube flagged THIS exit IP" -> dormant. (403s
 # are counted separately: often transient CDN, so it takes BLOCK_BUDGET of them in
 # one batch to conclude the IP is burned.)
@@ -422,12 +423,12 @@ run_worker() {
       # per-connection auth -> nothing for the provider to throttle. --dns
       # overrides the in-namespace resolver (the provider's own DNS throttles
       # under WORKERS parallel namespaces).
-      "$VOPONO" exec --custom "$WG_DIR/$server.conf" --protocol wireguard $DNS_ARG \
+      "$VOPONO" exec --custom "$WG_DIR/$server.conf" --protocol wireguard "${DNS_ARGS[@]}" \
         --user "$RUN_USER" "$appcmd" >>"$wlog" 2>&1 &
     else
       # OpenVPN: provider + server name (full config name, e.g. south_korea-kr112).
       "$VOPONO" exec --provider "$VPN_PROVIDER" --protocol openvpn \
-        --server "$server" $DNS_ARG --user "$RUN_USER" "$appcmd" >>"$wlog" 2>&1 &
+        --server "$server" "${DNS_ARGS[@]}" --user "$RUN_USER" "$appcmd" >>"$wlog" 2>&1 &
     fi
     local vp=$! held=0
     while (( held < SETUP_WINDOW )) && kill -0 "$vp" 2>/dev/null; do
