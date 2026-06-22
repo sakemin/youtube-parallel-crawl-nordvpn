@@ -185,6 +185,34 @@ $VENV/bin/python crawler/crawler.py IDS_FILE OUTPUT_DIR \
 
 ---
 
+## region-lock 실패 복구 (다른 region으로 재시도)
+
+실패한 영상 중 일부는 사라진 게 아니라 **region-lock**(`This video is not available
+in your country` / `blocked it in your country`)입니다. region A에서 돌렸을 때 실패해
+영구 skip-marker가 찍혔지만, **다른 region**의 exit IP로는 받을 수 있습니다.
+`bin/retry-region.sh`가 한 번의 복구 패스를 자동화합니다:
+
+```bash
+# 1. region 복구 가능한 실패만 골라 skip-marker를 지우고 리스트로 만듭니다.
+#    (정말 사라진 것 — 삭제/비공개/계정정지/전세계 저작권차단/연령제한/멤버전용 — 은
+#     다른 region으로도 안 되므로 제외)
+./bin/retry-region.sh                 # region-lock + 애매한 "unavailable"
+./bin/retry-region.sh --strict        # 명시적 "...in your country" 만 (고신뢰)
+./bin/retry-region.sh --dry-run       # 분류 결과만 출력, 아무것도 바꾸지 않음
+
+# 2. 스크립트가 정확한 두 명령을 출력 — 새 region용 풀 생성 후 재시도:
+COUNTRIES="united_states united_kingdom canada germany france brazil australia japan" sudo bin/setup.sh
+IDS_FILE="$OUTPUT_DIR/retry_region.txt" COUNTRIES="united_states united_kingdom …" ./crawl.sh
+```
+
+첫 실행과 **지리적으로 다른** region을 고르세요(예: 아시아에서 크롤 → 아메리카/유럽으로
+재시도). 그래야 원래 region에서 막힌 영상이 새 region 중 하나에선 풀릴 확률이 높습니다.
+복구된 영상은 평소처럼 `audio/`에 저장되고, 또 실패하면 새 skip-marker가 찍히며, 이미
+받은 영상은 자동으로 건너뜁니다. 실제 운영에서 "실패" 집합의 약 7%(region-lock 부분)를
+이렇게 복구했습니다.
+
+---
+
 ## 처리량 튜닝
 
 `WORKERS`를 1→9로 늘리며 워커 로그 전반의 합계 분당 다운로드를 관찰하세요. 업링크/대상 rate-limit/CPU가 포화되기 전까지 거의 선형으로 증가합니다 — 무릎(knee) 지점 직전에서 멈추세요. `LIMIT`(회전 전 IP당 다운로드)을 키우면 회전 오버헤드를 분산할 수 있지만, IP당 차단 한계 안에서 머무르세요. 하드 천장은 NordVPN의 10슬롯 상한입니다. 그 이상이 필요하면 **로테이팅 residential/datacenter 프록시 풀**로 전환해야 합니다(vopono는 "깨끗하고 격리된 소수의 IP"를 위한 도구입니다).

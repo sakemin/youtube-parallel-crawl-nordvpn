@@ -246,6 +246,34 @@ stale veth pairs / netns / NetworkManager state will make a fresh `vopono` panic
 
 ---
 
+## Recover region-locked failures (retry from a different region)
+
+Some videos aren't gone — they're **region-locked** (`This video is not available
+in your country` / `blocked it in your country`). When the crawl ran from regions
+A they failed and got a permanent skip-marker, but a **different region's** exit IP
+can usually fetch them. `bin/retry-region.sh` automates a one-pass recovery:
+
+```bash
+# 1. Select the region-recoverable failures, clear their skip-markers, write the list.
+#    (Skips the genuinely-gone: deleted / private / terminated / global copyright /
+#     age-gated / members-only — a different region can't help those.)
+./bin/retry-region.sh                 # region-locks + ambiguous "unavailable"
+./bin/retry-region.sh --strict        # ONLY explicit "...in your country" (high-confidence)
+./bin/retry-region.sh --dry-run       # just print the breakdown; change nothing
+
+# 2. It prints the exact two commands — build the pool for NEW regions, then retry:
+COUNTRIES="united_states united_kingdom canada germany france brazil australia japan" sudo bin/setup.sh
+IDS_FILE="$OUTPUT_DIR/retry_region.txt" COUNTRIES="united_states united_kingdom …" ./crawl.sh
+```
+
+Pick regions geographically *different* from your first run (e.g. crawled from Asia
+→ retry from the Americas/Europe) so a video locked out of the originals is likely
+available in at least one. Recovered videos land in `audio/` as usual; any that
+fail again get a fresh skip-marker, and already-downloaded ids are skipped. In a
+real run this recovered ~7% of the "failed" set (the region-locked slice).
+
+---
+
 ## Troubleshooting
 
 The four walls, by symptom:

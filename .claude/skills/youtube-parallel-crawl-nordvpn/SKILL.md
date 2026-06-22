@@ -80,6 +80,14 @@ Config knobs (all in `config.env`, overridable inline e.g. `WORKERS=4 ./crawl.sh
   supervisor lifecycle log) to tell FINISHED from CRASHED.
 - After any crash/hard-kill: `sudo ./bin/cleanup.sh` BEFORE re-running (stale
   veths/NetworkManager state makes new vopono panic).
+- `bin/retry-region.sh` — recover REGION-LOCKED failures from a DIFFERENT region.
+  Selects failures whose marker is region-recoverable ("...in your country" /
+  "blocked it in your country"; `--strict` = explicit only, default also includes
+  ambiguous "unavailable"), SKIPS the genuinely-gone (deleted/private/terminated/
+  global-copyright/age-gated/members-only), clears those skip-markers, writes
+  `retry_region.txt`, and prints: `COUNTRIES="<new diverse regions>" sudo bin/setup.sh`
+  then `IDS_FILE=retry_region.txt COUNTRIES="..." ./crawl.sh`. Pick regions
+  geographically different from the first run (~7% of "failures" recovered in practice).
 
 ## vopono gotchas (0.10.x)
 - The application is ONE shell-split argument: `vopono exec ... "yt-dlp -x URL"`,
